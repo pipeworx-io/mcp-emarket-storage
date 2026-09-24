@@ -809,11 +809,13 @@ function significantNameTokens(name: string): string[] {
  *
  * ⚠️ eMARKET-COVERED ISSUERS ONLY — NOT EVERY ITALIAN LISTED COMPANY. Italy
  * has a SECOND OAM, 1INFO (a separate, keyless JSON API covering ~314
- * issuers), and an issuer discloses through exactly one of the two. Some
- * well-known names (e.g. IREN, SOMEC) are 1INFO issuers and will NOT be
- * found here — confirmed 2026-09-23 by their absence from eMarket Storage's
- * own ~480-company issuer list. This pack does not merge 1INFO; a company
- * not found is reported as such, with that explanation, not as an error.
+ * issuers — see the sibling pack @pipeworx/oneinfo-storage), and an issuer
+ * discloses through exactly one of the two. Some well-known names (e.g.
+ * IREN, SOMEC) are 1INFO issuers and will NOT be found here — confirmed
+ * 2026-09-23 by their absence from eMarket Storage's own ~480-company issuer
+ * list. This pack does not merge 1INFO; a company not found is reported as
+ * such, pointing at oneinfo-storage's oneinfo_search_disclosures, not as an
+ * error.
  *
  * ⚠️ NO ISIN/LEI. Unlike amf-filings, eMarket Storage's listing and its
  * issuer picklist expose only a company NAME and an internal Teleborsa
@@ -875,7 +877,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'emarket_search_disclosures',
     description:
-      `Search Italian regulated company disclosures from eMarket Storage (Teleborsa), one of Italy's two EU Transparency Directive Officially Appointed Mechanisms. PREFER OVER esef_filing_search FOR ITALIAN ISSUERS COVERED HERE — this source is updated same-day, unlike the community ESEF index which runs months behind. Identify the issuer with company (free-text name, resolved against eMarket's own ~480-issuer list) or azienda_id (Teleborsa's internal numeric id, from a prior result) — there is no ISIN/LEI field on this source. date_to IS INCLUSIVE (the last day you want included) — this tool handles the underlying source's own date_to being EXCLUSIVE by always querying one calendar day past it, so date_from="2026-09-21", date_to="2026-09-22" correctly returns rows from BOTH the 21st and the 22nd; a single date_from with no date_to searches just that one day. COVERAGE: only issuers that disclose through eMarket Storage — a second Italian mechanism, 1INFO, covers a separate set of issuers (e.g. IREN, SOMEC) and is NOT included; an unmatched company name is reported as "not an eMarket Storage issuer", not as an error. Category codes: ${CATEGORY_HINT}. Returns disclosure EVENTS (title, company, timestamp, PDF link) — NOT extracted XBRL facts.`,
+      `Search Italian regulated company disclosures from eMarket Storage (Teleborsa), one of Italy's two EU Transparency Directive Officially Appointed Mechanisms. PREFER OVER esef_filing_search FOR ITALIAN ISSUERS COVERED HERE — this source is updated same-day, unlike the community ESEF index which runs months behind. Identify the issuer with company (free-text name, resolved against eMarket's own ~480-issuer list) or azienda_id (Teleborsa's internal numeric id, from a prior result) — there is no ISIN/LEI field on this source. date_to IS INCLUSIVE (the last day you want included) — this tool handles the underlying source's own date_to being EXCLUSIVE by always querying one calendar day past it, so date_from="2026-09-21", date_to="2026-09-22" correctly returns rows from BOTH the 21st and the 22nd; a single date_from with no date_to searches just that one day. COVERAGE: only issuers that disclose through eMarket Storage — a second Italian mechanism, 1INFO, covers a separate set of issuers (e.g. IREN, SOMEC) and is NOT included; use oneinfo-storage's oneinfo_search_disclosures for those. An unmatched company name is reported as "not an eMarket Storage issuer", not as an error. Category codes: ${CATEGORY_HINT}. Returns disclosure EVENTS (title, company, timestamp, PDF link) — NOT extracted XBRL facts.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -1102,7 +1104,7 @@ async function searchDisclosures(args: Record<string, unknown>): Promise<unknown
     if (ranked.length === 0) {
       return {
         error: `"${companyQuery}" does not match any eMarket Storage issuer.`,
-        note: 'This pack only covers issuers that disclose through eMarket Storage. A separate mechanism, 1INFO, covers a different set of Italian issuers (e.g. IREN, SOMEC) and is not included here — the company may be a 1INFO issuer instead.',
+        note: "This pack only covers issuers that disclose through eMarket Storage. A separate mechanism, 1INFO, covers a different set of Italian issuers (e.g. IREN, SOMEC) and is not included here — try oneinfo-storage's oneinfo_search_disclosures instead.",
       };
     }
     const top = ranked[0];

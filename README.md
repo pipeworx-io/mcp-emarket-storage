@@ -5,7 +5,7 @@ Italian regulated company disclosures direct from eMarket Storage (Teleborsa)
 built to fix the months-long lag in the community ESEF index for current-year
 Italian filings.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1678+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1679+ live data sources.
 
 ## Tools
 
@@ -32,12 +32,13 @@ day as the query), with its PDF confirmed reachable (HTTP 200).
 
 1. **eMarket-covered issuers only — this is not the full Italian market.**
    Italy has a SECOND, separate OAM, **1INFO** (a different keyless JSON API
-   covering roughly 314 issuers). An issuer discloses through exactly one of
-   the two. Some well-known names are 1INFO issuers and will NOT be found
-   here — confirmed 2026-09-23 by checking eMarket Storage's own ~480-company
-   issuer picklist: neither **IREN** nor **SOMEC** appear in it. A company
-   search that matches nothing returns an explanatory `note`, not a bare
-   error, saying the issuer may be a 1INFO issuer instead. This pack does not
+   covering roughly 314 issuers — see `@pipeworx/oneinfo-storage`). An issuer
+   discloses through exactly one of the two. Some well-known names are 1INFO
+   issuers and will NOT be found here — confirmed 2026-09-23 by checking
+   eMarket Storage's own ~480-company issuer picklist: neither **IREN** nor
+   **SOMEC** appear in it. A company search that matches nothing returns an
+   explanatory `note`, not a bare error, pointing at `oneinfo-storage`'s
+   `oneinfo_search_disclosures` instead. This pack does not
    merge 1INFO data.
 2. **This is a document index, not an XBRL-facts API.** Every row is a
    disclosure EVENT: a title, an issuer, a publication timestamp, and a link
@@ -154,7 +155,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1678+ data sources. The
+Both URLs reach the same gateway and the same 1679+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
