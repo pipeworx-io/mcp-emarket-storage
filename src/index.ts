@@ -1157,8 +1157,14 @@ async function searchDisclosures(args: Record<string, unknown>): Promise<unknown
     const issuers = await getAziendaMap();
     const ranked = rankMatches(companyQuery, issuers, (e) => e.name);
     if (ranked.length === 0) {
+      // A name that matches no issuer is a normal "no match" outcome, not a
+      // tool failure: until 2026-10-16 it was returned as a top-level `error`
+      // and booked as OUR error on every unknown company (6 of 20 calls in one
+      // day). found:false is the shape the gateway classifies as empty.
       return {
-        error: `"${companyQuery}" does not match any eMarket Storage issuer.`,
+        found: false,
+        reason: 'no_match',
+        message: `"${companyQuery}" does not match any eMarket Storage issuer.`,
         note: "This pack only covers issuers that disclose through eMarket Storage. A separate mechanism, 1INFO, covers a different set of Italian issuers (e.g. IREN, SOMEC) and is not included here — try oneinfo-storage's oneinfo_search_disclosures instead.",
       };
     }
@@ -1166,7 +1172,9 @@ async function searchDisclosures(args: Record<string, unknown>): Promise<unknown
     const tiedAtTop = ranked.filter((r) => r.score === top.score);
     if (tiedAtTop.length > 1) {
       return {
-        error: `"${companyQuery}" matches more than one eMarket Storage issuer equally well.`,
+        found: false,
+        reason: 'ambiguous_match',
+        message: `"${companyQuery}" matches more than one eMarket Storage issuer equally well — pass azienda_id or a more specific company name.`,
         candidates: tiedAtTop.slice(0, 10).map((r) => ({ azienda_id: r.item.id, company: r.item.name })),
       };
     }
