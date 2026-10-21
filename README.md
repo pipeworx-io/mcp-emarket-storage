@@ -5,7 +5,7 @@ Italian regulated company disclosures direct from eMarket Storage (Teleborsa)
 built to fix the months-long lag in the community ESEF index for current-year
 Italian filings.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1855+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -16,6 +16,16 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 - `emarket_get_disclosure(id, date)` — fetch one disclosure by its Teleborsa
   protocollo id and publication date (both come from a prior search — this
   source has no by-id-only lookup).
+- `emarket_search_documents(company?, azienda_id?, category?, date_from?, date_to?, limit?, offset?)`
+  — search eMarket Storage's SEPARATE document archive (annual/half-year
+  financial reports, ESEF/XBRL ZIP packages), not the press-release stream
+  `emarket_search_disclosures` returns. Use this when you need the actual
+  filing. `has_xbrl` flags rows carrying a downloadable ESEF/XBRL ZIP.
+
+**All three search parameters above (company/azienda_id on every tool, plus
+category/market) are optional.** Omit the issuer entirely to get every
+covered issuer's rows for a date window in ONE call — the cheap way to do a
+daily check across many issuers (see "One call per day" below).
 
 ## Why this pack exists
 
@@ -28,7 +38,25 @@ Directive disclosures, directly. **Measured live 2026-09-23**: a
 returned a WEBUILD disclosure published 2026-09-23T17:13 local time (same
 day as the query), with its PDF confirmed reachable (HTTP 200).
 
-## ⚠️ Four things a caller must know
+## One call per day, not one call per issuer
+
+A design partner running a daily check across ~155 issuers was calling once
+per issuer and burning through a 50-credit-per-call allowance in ~35 calls
+(fleet #3300, 2026-10). **That is unnecessary — every search tool here
+already supports a date-window query with NO issuer filter at all**, which
+returns every covered issuer's rows for that window in one call:
+
+```
+emarket_search_disclosures({date_from: "2026-10-19", date_to: "2026-10-19"})
+emarket_search_documents({date_from: "2026-10-19", date_to: "2026-10-19"})
+```
+
+Verified live 2026-10-19 — both return every eMarket-covered issuer's rows
+for the day, paginating (page_size 24) only if that single day's market-wide
+volume exceeds one page, which is rare. A 155-issuer daily check is one (or a
+small, bounded few) calls per pack per day, not 155.
+
+## ⚠️ Five things a caller must know
 
 1. **eMarket-covered issuers only — this is not the full Italian market.**
    Italy has a SECOND, separate OAM, **1INFO** (a different keyless JSON API
@@ -64,6 +92,14 @@ day as the query), with its PDF confirmed reachable (HTTP 200).
    asking for "the 21st through the 22nd" now correctly gets rows from both
    days. Confirmed locally: the same 21→22 request now returns rows dated
    both 2026-09-21 and 2026-09-22.
+5. **Two separate archives on the same site.** `emarket_search_disclosures`
+   is the press-release stream; `emarket_search_documents` is the actual
+   regulated-filing archive (annual reports, ESEF/XBRL ZIPs). The same
+   `category` code on each does NOT return the same rows — verified live
+   2026-10-19: Interpump's `category="100"` on `emarket_search_disclosures`
+   returns only a results press release, while the same filter on
+   `emarket_search_documents` returns "IP - Annual Financial Report 2025"
+   plus its ESEF XBRL ZIP. Use the right tool for what you actually need.
 
 ## Auth
 
@@ -108,8 +144,17 @@ Keyless. No account, no API key.
   listing page load. An ambiguous match (multiple issuers tied at the same
   score) returns `candidates` instead of guessing.
 - `emarket_get_disclosure` has no direct by-id endpoint on the source — it
-  re-fetches the given date's listing (paging up to 15 pages, i.e. up to 360
-  disclosures market-wide for that day) and matches on the protocollo id.
+  re-fetches the given date's listing (paging up to 8 pages, i.e. up to 192
+  disclosures market-wide for that day — measured live, the busiest single
+  day found was 3 pages deep) and matches on the protocollo id. Each page
+  fetch gets a 10s timeout rather than the shared 25s default, bounding the
+  worst case to 80s sequential rather than 375s — a design partner reported
+  ~230s stalls in production (fleet #3300) that line up with the old numbers.
+- `emarket_search_documents` reuses the same HTML row parser as
+  `emarket_search_disclosures`; its ESEF/XBRL rows carry a
+  `<span class="icon-esef">` marker before the title text and link to a
+  `/sites/default/files/xbrl/….zip` path instead of the usual
+  `/comunicati/….pdf` — both are handled, `has_xbrl` reflects which.
 
 ## Quick Start
 
@@ -155,7 +200,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1819+ data sources. The
+Both URLs reach the same gateway and the same 1855+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

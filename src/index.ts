@@ -671,6 +671,254 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
 
 // Reusable entity-resolution helpers for MCP packs. SELF-CONTAINED — no internal
 // imports — so publish-pack.sh can inline it into standalone pack builds the same
@@ -858,9 +1106,25 @@ function significantNameTokens(name: string): string[] {
  * Drupal View; this pack parses its HTML with targeted regex (Cloudflare
  * Workers have no DOMParser — same approach as spain-tenders/gdacs).
  *
+ * ⚠️ TWO SEPARATE ARCHIVES, SAME SITE, SAME FILTERS. comunicati-finanziari
+ * (emarket_search_disclosures) is the issuer's own PRESS-RELEASE stream;
+ * emarketstorage.it/it/documenti (emarket_search_documents) is the actual
+ * regulated-FILING archive — annual/half-year reports and ESEF/XBRL ZIP
+ * packages. Both expose the same azienda ids, category codes, pagination and
+ * date-filter quirk, but a category filter on one does NOT return the same
+ * rows as the other: verified live 2026-10-19, Interpump's category=100 on
+ * comunicati-finanziari returns only a press release ("IP - 2025 Financial
+ * Results"), while the identical filter on documenti returns "IP - Annual
+ * Financial Report 2025" plus its ESEF XBRL ZIP
+ * (/sites/default/files/xbrl/2026-04/20260402_181127.zip). Use
+ * emarket_search_documents when you actually need the filing, not an
+ * announcement about it.
+ *
  * ⚠️ DOCUMENT INDEX, NOT XBRL FACTS. Every row is a disclosure EVENT — a
- * title, an issuer, a timestamp, and a link to the underlying PDF. There is
- * no per-fact structured-data extraction (no "net income = X" lookup).
+ * title, an issuer, a timestamp, and a link to the underlying PDF (or, on
+ * emarket_search_documents, occasionally an ESEF/XBRL ZIP — `has_xbrl` flags
+ * those). There is no per-fact structured-data extraction (no "net income =
+ * X" lookup).
  *
  * ⚠️ eMARKET-COVERED ISSUERS ONLY — NOT EVERY ITALIAN LISTED COMPANY. Italy
  * has a SECOND OAM, 1INFO (a separate, keyless JSON API covering ~314
@@ -896,13 +1160,28 @@ function significantNameTokens(name: string): string[] {
 const UA = 'Pipeworx/1.0 (+https://pipeworx.io; support@pipeworx.io)';
 const ORIGIN = 'https://www.emarketstorage.it';
 const LISTING_PATH = '/it/comunicati-finanziari';
-const PAGE_SIZE = 24; // Drupal view's fixed page size — verified live, every page but the last was exactly 24 rows.
+// A SEPARATE Drupal view, same filters/markup/category codes/pagination as
+// LISTING_PATH, but a different underlying archive: comunicati-finanziari is
+// the press-release stream (an issuer's OWN announcements about its results),
+// while documenti is the actual regulated-FILING archive — annual-report PDFs
+// and ESEF/XBRL ZIP packages included. Verified live 2026-10-19: Interpump's
+// category=100 (1.1 Relazioni finanziarie annuali) on comunicati-finanziari
+// returns 2 press releases ("IP - 2025 Financial Results") with no annual
+// report anywhere; the SAME azienda_id + category on documenti returns the
+// actual "IP - Annual Financial Report 2025" PDF plus its ESEF XBRL ZIP
+// (/sites/default/files/xbrl/2026-04/20260402_181127.zip). Both routes share
+// the azienda id space (1309 = Interpump Group on both) and the same
+// date-filter exclusive-of-day-to quirk, so the fetch/paging/date machinery
+// below is shared; only the listing path and the ESEF-icon markup differ.
+const DOCUMENTI_PATH = '/it/documenti';
+const PAGE_SIZE = 24; // Drupal view's fixed page size — verified live, every page but the last was exactly 24 rows (true on both routes).
 
-async function pwFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+async function pwFetch(url: string | URL, init?: RequestInit, timeoutMs?: number): Promise<Response> {
   return fetchWithTimeout(
     url,
     { ...init, headers: { Accept: 'text/html', 'User-Agent': UA, ...(init?.headers ?? {}) } },
     'eMarket Storage (Teleborsa OAM)',
+    timeoutMs,
   );
 }
 
@@ -932,7 +1211,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'emarket_search_disclosures',
     description:
-      `Search Italian regulated company disclosures from eMarket Storage (Teleborsa), one of Italy's two EU Transparency Directive Officially Appointed Mechanisms. PREFER OVER esef_filing_search FOR ITALIAN ISSUERS COVERED HERE — this source is updated same-day, unlike the community ESEF index which runs months behind. Identify the issuer with company (free-text name, resolved against eMarket's own ~480-issuer list) or azienda_id (Teleborsa's internal numeric id, from a prior result) — there is no ISIN/LEI field on this source. date_to IS INCLUSIVE (the last day you want included) — this tool handles the underlying source's own date_to being EXCLUSIVE by always querying one calendar day past it, so date_from="2026-09-21", date_to="2026-09-22" correctly returns rows from BOTH the 21st and the 22nd; a single date_from with no date_to searches just that one day. COVERAGE: only issuers that disclose through eMarket Storage — a second Italian mechanism, 1INFO, covers a separate set of issuers (e.g. IREN, SOMEC) and is NOT included; use oneinfo-storage's oneinfo_search_disclosures for those. An unmatched company name is reported as "not an eMarket Storage issuer", not as an error. Category codes: ${CATEGORY_HINT}. Returns disclosure EVENTS (title, company, timestamp, PDF link) — NOT extracted XBRL facts.`,
+      `Search Italian regulated company disclosures from eMarket Storage (Teleborsa), one of Italy's two EU Transparency Directive Officially Appointed Mechanisms. PREFER OVER esef_filing_search FOR ITALIAN ISSUERS COVERED HERE — this source is updated same-day, unlike the community ESEF index which runs months behind. Identify the issuer with company (free-text name, resolved against eMarket's own ~480-issuer list) or azienda_id (Teleborsa's internal numeric id, from a prior result) — there is no ISIN/LEI field on this source. BOTH ARE OPTIONAL — omit company/azienda_id entirely to get every covered issuer's disclosures in the date window in ONE call (page with limit/offset, page_size=24, only if that day's volume exceeds one page); cheaper than one call per issuer for a multi-issuer daily check. date_to IS INCLUSIVE (the last day you want included) — this tool handles the underlying source's own date_to being EXCLUSIVE by always querying one calendar day past it, so date_from="2026-09-21", date_to="2026-09-22" correctly returns rows from BOTH the 21st and the 22nd; a single date_from with no date_to searches just that one day. COVERAGE: only issuers that disclose through eMarket Storage — a second Italian mechanism, 1INFO, covers a separate set of issuers (e.g. IREN, SOMEC) and is NOT included; use oneinfo-storage's oneinfo_search_disclosures for those. An unmatched company name is reported as "not an eMarket Storage issuer", not as an error. Category codes: ${CATEGORY_HINT}. Returns disclosure EVENTS (title, company, timestamp, PDF link) — NOT extracted XBRL facts.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -961,6 +1240,23 @@ const tools: McpToolExport['tools'] = [
       required: ['id', 'date'],
     },
   },
+  {
+    name: 'emarket_search_documents',
+    description:
+      `Search eMarket Storage's DOCUMENT ARCHIVE — a SEPARATE repository from emarket_search_disclosures' press-release stream, covering the actual regulated filings: annual/half-year financial reports, ESEF/XBRL packages, AGM documentation and similar. Use this (not emarket_search_disclosures) when you need the annual report or ESEF package itself, not an issuer's press release ABOUT it — verified live 2026-10-19: Interpump's category=100 on emarket_search_disclosures returns only its results press release, while this tool's category=100 on the same issuer returns "IP - Annual Financial Report 2025" plus its ESEF XBRL ZIP. Same issuer ids, category codes, and INCLUSIVE date_to convention as emarket_search_disclosures — see that tool's description for the date-window mechanics. has_xbrl flags rows that carry a downloadable ESEF/XBRL ZIP (document_url then points at the .zip, not a .pdf). Category codes: ${CATEGORY_HINT}.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        company: { type: 'string', description: 'Free-text issuer name, e.g. "Interpump", "Saipem". Resolved against the same issuer picklist as emarket_search_disclosures. Optional — omit along with azienda_id to get every issuer\'s documents in the date window in one call.' },
+        azienda_id: { type: ['string', 'number'], description: "Teleborsa's internal issuer id, from a prior emarket_search_disclosures or emarket_search_documents result." },
+        category: { type: 'string', description: 'Category code to filter by, e.g. "100" for annual financial reports/ESEF packages. See tool description for the full code list.' },
+        date_from: { type: 'string', description: 'Only documents published on or after this date (YYYY-MM-DD, inclusive). If date_to is omitted, searches just this one day.' },
+        date_to: { type: 'string', description: 'Only documents published on or before this date (YYYY-MM-DD, INCLUSIVE). Same exclusive-upstream-bound handling as emarket_search_disclosures.' },
+        limit: { type: ['number', 'string'], description: `Number of documents to return (1-${PAGE_SIZE}). Default 10.` },
+        offset: { type: ['number', 'string'], description: 'Result offset for pagination. Default 0.' },
+      },
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
@@ -970,6 +1266,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
         return await searchDisclosures(args);
       case 'emarket_get_disclosure':
         return await getDisclosure(args);
+      case 'emarket_search_documents':
+        return await searchDocuments(args);
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -1016,6 +1314,7 @@ interface RawRow {
   company: string;
   title: string;
   documentUrl: string | null;
+  hasXbrl: boolean;
   publishedAtLocal: string | null;
 }
 
@@ -1038,20 +1337,33 @@ function extractRows(html: string): RawRow[] {
   return rows;
 }
 
+// Shared row shape across BOTH comunicati-finanziari (press releases) and
+// documenti (the regulated-filing archive). The documenti route's ESEF/XBRL
+// rows differ from every other row in two ways, both handled here:
+//   - the document link is /sites/default/files/xbrl/…/*.zip, not the
+//     /sites/default/files/comunicati/…/*.pdf path every other row uses;
+//   - the title link's own text is preceded by an icon marker,
+//     <span class="icon-esef" title="…"></span>, which the old title regex
+//     (expecting no nested tag before the text) silently failed to match —
+//     verified live 2026-10-19, the row parsed with title: null even though
+//     the row itself (and its ZIP) were present and fetchable.
 function parseRow(block: string): RawRow | null {
   const protoM = /data-protocollo="(\d+)"/.exec(block);
   if (!protoM) return null;
   const aziendaM = /comunicati-finanziari\?azienda=(\d+)/.exec(block);
-  const pdfM = /href="(\/sites\/default\/files\/comunicati\/[^"]+\.pdf)"/.exec(block);
+  const pdfM = /href="(\/sites\/default\/files\/(?:comunicati|xbrl)\/[^"]+\.(?:pdf|zip))"/i.exec(block);
   const timeM = /<time[^>]*>([^<]+)<\/time>/.exec(block);
   const companyM = /class="news-azienda"><a[^>]*>([^<]*)<\/a>/.exec(block);
-  const titleM = /class="news-title"><a[^>]*>([^<]*)<\/a>/.exec(block);
+  // Allow an optional leading <span class="icon-esef" …></span> before the
+  // actual title text (present on every ESEF/XBRL row on the documenti route).
+  const titleM = /class="news-title"><a[^>]*>(?:<span[^>]*class="icon-esef"[^>]*><\/span>)?([^<]*)<\/a>/.exec(block);
   return {
     protocollo: protoM[1],
     aziendaId: aziendaM ? aziendaM[1] : null,
     company: companyM ? stripMarkup(companyM[1]).trim() : '',
     title: titleM ? stripMarkup(titleM[1]).trim() : '',
     documentUrl: pdfM ? `${ORIGIN}${pdfM[1]}` : null,
+    hasXbrl: /icon-esef/.test(block) || /\.zip"/i.test(block),
     publishedAtLocal: timeM ? isoFromItalianDateTime(timeM[1].trim()) : null,
   };
 }
@@ -1074,8 +1386,8 @@ function parseListing(html: string): { rows: RawRow[]; hasNext: boolean; lastPag
   return { rows, hasNext, lastPageIndex: lastM ? Number(lastM[1]) : null };
 }
 
-async function fetchListing(params: URLSearchParams): Promise<{ rows: RawRow[]; hasNext: boolean; lastPageIndex: number | null }> {
-  const res = await pwFetch(`${ORIGIN}${LISTING_PATH}?${params.toString()}`);
+async function fetchListing(params: URLSearchParams, path: string = LISTING_PATH, timeoutMs?: number): Promise<{ rows: RawRow[]; hasNext: boolean; lastPageIndex: number | null }> {
+  const res = await pwFetch(`${ORIGIN}${path}?${params.toString()}`, undefined, timeoutMs);
   if (!res.ok) throw await httpError(res, 'eMarket Storage (Teleborsa OAM)');
   return parseListing(await res.text());
 }
@@ -1106,6 +1418,7 @@ function shapeRow(r: RawRow, categoryArg: string | undefined): Record<string, un
     published_at_local: r.publishedAtLocal,
     timezone: 'Europe/Rome',
     document_url: r.documentUrl,
+    has_xbrl: r.hasXbrl,
   };
 }
 
@@ -1233,16 +1546,108 @@ async function getDisclosure(args: Record<string, unknown>): Promise<unknown> {
   if (!date) throw new Error('emarket_get_disclosure requires "date" — the disclosure\'s publication date (YYYY-MM-DD). This source has no by-id lookup, only by-day listings.');
 
   const dateTo = addOneDay(date);
-  const MAX_PAGES = 15; // bounds the worst case (a very busy day for the whole market) to ~15 sequential fetches.
+  // Bounds the worst case to a handful of SEQUENTIAL page fetches — and each
+  // one gets a SHORT per-call timeout, not the shared 25s default. Both
+  // numbers were sized against measured reality, not guessed: the busiest
+  // single market-wide day found live (2026-03-20, annual-results season)
+  // was 3 pages deep (page=2 was the last), and an ordinary day is 1-2.
+  // MAX_PAGES=8 is already 2.6x that measured peak. The reason to shorten the
+  // per-fetch timeout rather than rely on MAX_PAGES alone: a design partner
+  // reported ~230s stalls in production (fleet #3300) — measured against the
+  // OLD numbers (MAX_PAGES=15 × the shared 25s default = up to 375s
+  // sequential worst case), which is exactly the order of magnitude they hit.
+  // These are small HTML page fetches that normally return in well under a
+  // second (verified live throughout this fix); 10s is generous slack for a
+  // slow-but-alive upstream while keeping the new worst case (8 × 10s = 80s)
+  // well inside any reasonable client timeout.
+  const MAX_PAGES = 8;
+  const PAGE_TIMEOUT_MS = 10_000;
   for (let page = 0; page < MAX_PAGES; page++) {
     const params = new URLSearchParams({ data_from: date, data_to: dateTo });
     if (page > 0) params.set('page', String(page));
-    const { rows, hasNext } = await fetchListing(params);
+    const { rows, hasNext } = await fetchListing(params, LISTING_PATH, PAGE_TIMEOUT_MS);
     const hit = rows.find((r) => r.protocollo === id);
     if (hit) return shapeRow(hit, undefined);
     if (!hasNext) break;
   }
   return { error: 'disclosure not found for that id/date', id, date };
+}
+
+async function searchDocuments(args: Record<string, unknown>): Promise<unknown> {
+  const companyQuery = strArg(args.company);
+  const aziendaIdArg = strArg(args.azienda_id);
+  const categoryArg = strArg(args.category);
+  const dateFrom = strArg(args.date_from);
+  const dateToArg = strArg(args.date_to);
+  const limit = clampInt(args.limit, 10, 1, PAGE_SIZE);
+  const offset = clampInt(args.offset, 0, 0, 100000);
+
+  // Same INCLUSIVE date_to / exclusive-upstream-bound handling as
+  // emarket_search_disclosures (verified live 2026-10-19 that this route has
+  // the identical off-by-one quirk) — see that tool's implementation comment
+  // for the measured proof.
+  const inclusiveDateTo = dateToArg ?? dateFrom;
+  const upstreamDateTo = inclusiveDateTo ? addOneDay(inclusiveDateTo) : undefined;
+
+  let aziendaId: string | undefined = aziendaIdArg;
+  let resolvedCompany: string | undefined;
+  let candidates: { azienda_id: string; company: string }[] | undefined;
+
+  if (!aziendaId && companyQuery) {
+    const issuers = await getAziendaMap();
+    const ranked = rankMatches(companyQuery, issuers, (e) => e.name);
+    if (ranked.length === 0) {
+      return {
+        found: false,
+        reason: 'no_match',
+        message: `"${companyQuery}" does not match any eMarket Storage issuer.`,
+        note: "This pack only covers issuers that disclose through eMarket Storage. A separate mechanism, 1INFO, covers a different set of Italian issuers (e.g. IREN, SOMEC) and is not included here — try oneinfo-storage's oneinfo_search_disclosures instead.",
+      };
+    }
+    const top = ranked[0];
+    const tiedAtTop = ranked.filter((r) => r.score === top.score);
+    if (tiedAtTop.length > 1) {
+      return {
+        found: false,
+        reason: 'ambiguous_match',
+        message: `"${companyQuery}" matches more than one eMarket Storage issuer equally well — pass azienda_id or a more specific company name.`,
+        candidates: tiedAtTop.slice(0, 10).map((r) => ({ azienda_id: r.item.id, company: r.item.name })),
+      };
+    }
+    aziendaId = top.item.id;
+    resolvedCompany = top.item.name;
+    candidates = ranked.slice(0, 5).map((r) => ({ azienda_id: r.item.id, company: r.item.name }));
+  }
+
+  const page = Math.floor(offset / PAGE_SIZE);
+  const withinPageOffset = offset - page * PAGE_SIZE;
+
+  const params = new URLSearchParams();
+  if (dateFrom) params.set('data_from', dateFrom);
+  if (upstreamDateTo) params.set('data_to', upstreamDateTo);
+  if (aziendaId) params.set('azienda', aziendaId);
+  if (categoryArg) params.set('categoria', categoryArg);
+  if (page > 0) params.set('page', String(page));
+
+  const { rows, hasNext, lastPageIndex } = await fetchListing(params, DOCUMENTI_PATH);
+  const pageSlice = rows.slice(withinPageOffset, withinPageOffset + limit);
+  const shaped = pageSlice.map((r) => shapeRow(r, categoryArg));
+
+  return {
+    count: shaped.length,
+    limit,
+    offset,
+    has_more: hasNext || withinPageOffset + limit < rows.length,
+    page_size: PAGE_SIZE,
+    ...(lastPageIndex !== null ? { at_least_total: lastPageIndex * PAGE_SIZE } : {}),
+    ...(dateFrom ? { date_from: dateFrom } : {}),
+    ...(inclusiveDateTo ? { date_to: inclusiveDateTo, upstream_date_to_exclusive: upstreamDateTo } : {}),
+    ...(aziendaId ? { azienda_id: aziendaId } : {}),
+    ...(resolvedCompany ? { company_resolved: resolvedCompany } : {}),
+    ...(candidates && candidates.length > 1 ? { other_candidates: candidates.filter((c) => c.azienda_id !== aziendaId) } : {}),
+    ...(categoryArg ? { category: categoryArg, category_label: CATEGORY_LABELS[categoryArg] ?? null } : {}),
+    documents: shaped,
+  };
 }
 
 export default { tools, callTool, meter: { credits: 1 } } satisfies McpToolExport;
