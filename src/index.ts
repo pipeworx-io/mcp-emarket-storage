@@ -1013,6 +1013,13 @@ interface SecEntity {
    * `matched_by: 'company_name'` alone cannot (fleet #3100).
    */
   matched_kind?: MatchKind;
+  /**
+   * Other companies whose names also matched — distinct companies, deduped
+   * by CIK, excluding this issuer's own share classes (never the winner's
+   * own ticker/CIK under a different symbol). Consumers read this to tell a
+   * genuinely CONTESTED name match from a clean one. See
+   * `distinctCompanyAlternatives` below for how it's built (fleet #3621).
+   */
   alternatives?: { ticker: string; company_name: string; cik: string; kind: MatchKind }[];
 }
 
@@ -1050,17 +1057,39 @@ async function resolveSecEntity(
   if (ranked.length) {
     const best = toEntity(ranked[0].item, 'company_name');
     best.matched_kind = ranked[0].kind;
-    const alts = ranked.slice(1, 4).map((m) => ({
-      ticker: m.item.ticker,
-      company_name: m.item.title,
-      cik: String(m.item.cik_str),
-      kind: m.kind,
-    }));
+    const alts = distinctCompanyAlternatives(ranked);
     if (alts.length) best.alternatives = alts;
     return best;
   }
 
   throw new Error(`No SEC company matches "${query}". Pass a US-listed ticker ("AAPL") or the exact listed-company name ("Apple Inc."). If this is a clinical-trial sponsor, an operating subsidiary (e.g. "Merck Sharp & Dohme" → Merck & Co), or a foreign/private entity, call sponsor_to_filer({sponsor}) instead — it resolves subsidiaries to the listed parent and honestly reports when no US-listed filer exists.`);
+}
+
+/** `alternatives` lists at most this many OTHER companies; company-spine.test.ts pins it to the real function. */
+const ALTERNATIVES_CAP = 3;
+
+/**
+ * The runners-up for a name match, as DISTINCT COMPANIES (fleet #3621).
+ *
+ * company_tickers.json lists one row per ticker, so an issuer with preferred
+ * shares appears several times under one CIK (Ford: F, F-PB, F-PC, F-PD; AT&T:
+ * T, TBB, T-PA, T-PC). Slicing the ranked rows left those rows to fill every
+ * alternatives slot, hiding any real rival ranked behind them, and made a company
+ * its own "alternative". So: drop every row that is the winner's own CIK, keep
+ * only the best-ranked row of each other CIK, THEN cap. The winner's other
+ * tickers are not lost information: they are the same company, and `ticker` /
+ * `cik` already identify it. `ranked` is already best-first, so first-seen wins.
+ */
+function distinctCompanyAlternatives(ranked: RankedMatch<SecTickerRow>[]): NonNullable<SecEntity['alternatives']> {
+  const seen = new Set<number>([ranked[0].item.cik_str]);
+  const out: NonNullable<SecEntity['alternatives']> = [];
+  for (const m of ranked.slice(1)) {
+    if (seen.has(m.item.cik_str)) continue;
+    seen.add(m.item.cik_str);
+    out.push({ ticker: m.item.ticker, company_name: m.item.title, cik: String(m.item.cik_str), kind: m.kind });
+    if (out.length >= ALTERNATIVES_CAP) break;
+  }
+  return out;
 }
 
 function toEntity(r: SecTickerRow, matched_by: 'ticker' | 'company_name'): SecEntity {
