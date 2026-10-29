@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-emarket-storage",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "description": "Italian regulated disclosures direct from eMarket Storage (Teleborsa) — keyless, same-day-fresh.",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-emarket-storage": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "emarket-storage"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-emarket-storage.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/emarket-storage",
   "pipeworx": {
-    "sourceHash": "v1-7a1300e601cda197b5f68de83d9ff1dc4320a675b1ee1eed7eff8fadf52856fa",
-    "sourceCommit": "24e32b525f9c0b2fd7d94b519b08abb108cc11cd"
+    "mode": "gateway",
+    "slug": "emarket-storage",
+    "gatewaySlug": "emarket-storage",
+    "sourceHash": "v1-8a004bc75e9f2fe2702474e4ea6af7da31992008334549d91ccdacdc64f6d207",
+    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
   }
 }
