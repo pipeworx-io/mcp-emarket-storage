@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-emarket-storage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Italian regulated disclosures direct from eMarket Storage (Teleborsa) — keyless, same-day-fresh.",
   "type": "module",
   "main": "lib/index.js",
@@ -27,7 +27,7 @@
     "mode": "gateway",
     "slug": "emarket-storage",
     "gatewaySlug": "emarket-storage",
-    "sourceHash": "v1-8a004bc75e9f2fe2702474e4ea6af7da31992008334549d91ccdacdc64f6d207",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceHash": "v1-e1687bdc86671c810574faacc69d06b000f19ab103c48ed223d857e1869f6a74",
+    "sourceCommit": "e707a4bb6209f432984c0a83bf64b3138130db89"
   }
 }
